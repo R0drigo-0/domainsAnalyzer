@@ -1,0 +1,5 @@
+zoneFile
+*.parquet
+*.csv
+*.json
+.env

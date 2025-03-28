@@ -1,0 +1,4 @@
+beatifulsoup4
+tldextract
+pyarrow
+pandas
