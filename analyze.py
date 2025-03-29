@@ -1,9 +1,270 @@
+from datetime import datetime
 import pyarrow.parquet as pq
 import pandas as pd
-import os
 import json
-import tldextract
+import os
+
 from datetime import datetime
+import dns.resolver
+import tldextract
+import requests
+import socket
+import struct
+import whois
+import ssl
+import json
+
+
+def read_json(file_path, keyword: str = None):
+    with open(file_path, "r") as f:
+        data = json.load(f)
+    if keyword:
+        return data.get(keyword, [])
+    return data
+
+
+def analyze_domains(domain: str):
+    if not domain:
+        return None
+
+    domain_info = {
+        "domain": domain,
+        "analysis_timestamp": datetime.now().isoformat(),
+        "dns_records": {},
+        "whois_info": {},
+        "ssl_info": {},
+        "http_info": {},
+        "related_domains": [],
+        "security_checks": {},
+    }
+
+    extract_result = tldextract.extract(domain)
+    domain_info["domain_parts"] = {
+        "subdomain": extract_result.subdomain,
+        "domain": extract_result.domain,
+        "suffix": extract_result.suffix,
+        "registered_domain": extract_result.registered_domain,
+    }
+
+    dns_types = ["A", "AAAA", "MX", "NS", "TXT", "SOA", "CNAME"]
+    for record_type in dns_types:
+        try:
+            answers = dns.resolver.resolve(domain, record_type)
+            domain_info["dns_records"][record_type] = [str(rdata) for rdata in answers]
+        except Exception as e:
+            domain_info["dns_records"][record_type] = str(e)
+
+    try:
+        ip_addresses = socket.gethostbyname_ex(domain)[2]
+        domain_info["ip_addresses"] = ip_addresses
+    except Exception as e:
+        domain_info["ip_addresses_error"] = str(e)
+
+    try:
+        whois_data = whois.whois(domain)
+        domain_info["whois_info"] = {
+            "registrar": whois_data.registrar,
+            "creation_date": str(whois_data.creation_date),
+            "expiration_date": str(whois_data.expiration_date),
+            "last_updated": str(whois_data.updated_date),
+            "name_servers": whois_data.name_servers,
+        }
+        domain_info["whois_info"]["age_days"] = (
+            (
+                (datetime.now() - whois_data.creation_date[0])
+                if isinstance(whois_data.creation_date, list)
+                else (datetime.now() - whois_data.creation_date)
+            ).days
+            if whois_data.creation_date
+            else None
+        )
+    except Exception as e:
+        domain_info["whois_info_error"] = str(e)
+
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((domain, 443), timeout=3) as sock:
+            with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                cert = ssock.getpeercert()
+                domain_info["ssl_info"] = {
+                    "subject": dict(x[0] for x in cert["subject"]),
+                    "issuer": dict(x[0] for x in cert["issuer"]),
+                    "version": cert["version"],
+                    "serialNumber": cert["serialNumber"],
+                    "notBefore": cert["notBefore"],
+                    "notAfter": cert["notAfter"],
+                    "subjectAltName": [x[1] for x in cert["subjectAltName"]],
+                }
+    except Exception as e:
+        domain_info["ssl_info_error"] = str(e)
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        for protocol in ["https", "http"]:
+            try:
+                response = requests.get(
+                    f"{protocol}://{domain}",
+                    headers=headers,
+                    timeout=5,
+                    allow_redirects=True,
+                )
+                domain_info["http_info"][protocol] = {
+                    "status_code": response.status_code,
+                    "headers": dict(response.headers),
+                    "redirect_history": [
+                        {"url": r.url, "status_code": r.status_code}
+                        for r in response.history
+                    ],
+                    "final_url": response.url,
+                    "content_length": len(response.text),
+                    "title": (
+                        response.text.split("<title>")[1].split("</title>")[0]
+                        if "<title>" in response.text
+                        else None
+                    ),
+                }
+                break  # If HTTPS works, no need to check HTTP
+            except Exception as e:
+                domain_info["http_info"][protocol] = {"error": str(e)}
+    except Exception as e:
+        domain_info["http_info_error"] = str(e)
+
+    # Security checks
+    domain_info["security_checks"] = {
+        "is_newly_registered": (
+            domain_info["whois_info"].get("age_days", 365) < 30
+            if "age_days" in domain_info["whois_info"]
+            else None
+        ),
+        "has_ssl": "ssl_info_error" not in domain_info,
+        "uses_cloudflare": (
+            any(
+                "cloudflare" in str(v).lower()
+                for k, v in domain_info.get("http_info", {})
+                .get("https", {})
+                .get("headers", {})
+                .items()
+            )
+            if "https" in domain_info.get("http_info", {})
+            else False
+        ),
+        "suspicious_tld": extract_result.suffix
+        in [".tk", ".ml", ".ga", ".cf", ".gq", ".top", ".xyz"],
+        "domain_typos": None,
+    }
+
+    return domain_info
+
+
+def analyze_ip(ip: str):
+    if not ip:
+        return None
+
+    ip_info = {
+        "ip": ip,
+        "analysis_timestamp": datetime.now().isoformat(),
+        "basic_info": {},
+        "geolocation": {},
+        "dns_info": {},
+        "network_info": {},
+        "open_ports": [],
+        "connected_domains": [],
+    }
+
+    try:
+        socket.inet_aton(ip)
+        ip_type = "IPv4"
+
+        ip_num = struct.unpack("!I", socket.inet_aton(ip))[0]
+
+        private_ranges = [
+            ("10.0.0.0", "10.255.255.255"),  # Class A private range
+            ("172.16.0.0", "172.31.255.255"),  # Class B private range
+            ("192.168.0.0", "192.168.255.255"),  # Class C private range
+            ("127.0.0.0", "127.255.255.255"),  # Loopback range
+            (
+                "169.254.0.0",
+                "169.254.255.255",
+            ),  # Link-local range (missing in original)
+        ]
+
+        private_ranges_int = [
+            (
+                struct.unpack("!I", socket.inet_aton(lower))[0],
+                struct.unpack("!I", socket.inet_aton(upper))[0],
+            )
+            for lower, upper in private_ranges
+        ]
+
+        is_private = any(
+            lower <= ip_num <= upper for lower, upper in private_ranges_int
+        )
+
+        ip_info["basic_info"] = {
+            "ip_type": ip_type,
+            "is_private": is_private,
+            "is_valid": True,
+        }
+    except socket.error:
+        ip_info["basic_info"] = {
+            "is_valid": False,
+            "error": "Invalid IP address format",
+        }
+        return ip_info
+
+    # Get geolocation info (no API key required)
+    try:
+        response = requests.get(f"https://ipapi.co/{ip}/json/", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            ip_info["geolocation"] = {
+                "country": data.get("country_name"),
+                "country_code": data.get("country_code"),
+                "region": data.get("region"),
+                "city": data.get("city"),
+                "latitude": data.get("latitude"),
+                "longitude": data.get("longitude"),
+                "timezone": data.get("timezone"),
+                "org": data.get("org"),
+                "asn": data.get("asn"),
+            }
+    except Exception as e:
+        ip_info["geolocation_error"] = str(e)
+
+    # Reverse DNS lookup
+    try:
+        hostname, _, _ = socket.gethostbyaddr(ip)
+        ip_info["dns_info"]["hostname"] = hostname
+    except (socket.herror, socket.gaierror):
+        ip_info["dns_info"]["hostname"] = None
+
+    # Check common open ports (FUTURE)
+
+    # Check traceroute information
+    try:
+        import subprocess
+
+        if os.name == "nt":  # Windows
+            output = subprocess.check_output(
+                ["tracert", "-d", "-w", "500", "-h", "10", ip],
+                stderr=subprocess.STDOUT,
+                timeout=15,
+            )
+        else:  # Linux/Mac
+            output = subprocess.check_output(
+                ["traceroute", "-n", "-w", "1", "-m", "10", ip],
+                stderr=subprocess.STDOUT,
+                timeout=15,
+            )
+
+        output_str = output.decode("utf-8", errors="ignore")
+        ip_info["network_info"]["traceroute"] = output_str
+    except Exception as e:
+        ip_info["network_info"]["traceroute_error"] = str(e)
+
+    return ip_info
 
 
 def process_parquet(file_path, batch_size=5000):
@@ -25,195 +286,7 @@ def process_parquet(file_path, batch_size=5000):
     keywords_found = {}
 
     # Lists of suspicious patterns
-    suspicious_keywords = [
-        # Financial/Banking
-        "login",
-        "account",
-        "secure",
-        "verify",
-        "bank",
-        "pay",
-        "wallet",
-        "crypto",
-        "payment",
-        "invoice",
-        "transaction",
-        "banking",
-        "credit",
-        "debit",
-        "finance",
-        "paypal",
-        "billing",
-        "checkout",
-        "balance",
-        "transfer",
-        "deposit",
-        "withdraw",
-        # Authentication/Security
-        "support",
-        "service",
-        "update",
-        "confirm",
-        "auth",
-        "validation",
-        "verify",
-        "password",
-        "recovery",
-        "reset",
-        "security",
-        "protect",
-        "access",
-        "unlock",
-        "authenticate",
-        "authorize",
-        "verification",
-        "identity",
-        "trusted",
-        "safe",
-        # E-commerce
-        "shop",
-        "store",
-        "order",
-        "track",
-        "shipping",
-        "delivery",
-        "purchase",
-        "customer",
-        "refund",
-        "discount",
-        "deal",
-        "offer",
-        "cart",
-        "buy",
-        "sale",
-        # Email/Communication
-        "mail",
-        "webmail",
-        "inbox",
-        "message",
-        "notification",
-        "alert",
-        "confirm",
-        "subscribe",
-        "newsletter",
-        "contact",
-        "help",
-        "chat",
-        "support",
-        # Common actions
-        "sign",
-        "signin",
-        "signup",
-        "register",
-        "submit",
-        "renew",
-        "extend",
-        "activate",
-        "reactivate",
-        "upgrade",
-        "manage",
-        "suspend",
-        "blocked",
-        "limited",
-        "restore",
-        "recover",
-        "fix",
-        "repair",
-        # Urgency terms
-        "expire",
-        "expiry",
-        "urgent",
-        "important",
-        "alert",
-        "warning",
-        "limited",
-        "notice",
-        "critical",
-        "immediate",
-        "deadline",
-        "required",
-        "mandatory",
-        "suspended",
-        "locked",
-        "disabled",
-        "restricted",
-        "compromised",
-        # Government/Official
-        "gov",
-        "tax",
-        "revenue",
-        "official",
-        "legal",
-        "form",
-        "document",
-        "license",
-        "permit",
-        "certificate",
-        "statement",
-        "record",
-        "file",
-        "claim",
-        "benefit",
-        # Tech platforms
-        "cloud",
-        "storage",
-        "drive",
-        "sync",
-        "connect",
-        "app",
-        "portal",
-        "panel",
-        "dashboard",
-        "platform",
-        "profile",
-        "setting",
-        "preference",
-        "subscription",
-        # Cryptocurrency
-        "bitcoin",
-        "eth",
-        "ethereum",
-        "wallet",
-        "crypto",
-        "token",
-        "coin",
-        "mining",
-        "exchange",
-        "blockchain",
-        "nft",
-        "defi",
-        "stake",
-        "yield",
-        "liquidity",
-        # Social engineering
-        "prize",
-        "winner",
-        "reward",
-        "bonus",
-        "gift",
-        "voucher",
-        "coupon",
-        "free",
-        "grant",
-        "compensation",
-        "survey",
-        "questionnaire",
-        "feedback",
-        "review",
-        # Technical combinations
-        "web-access",
-        "online-banking",
-        "user-portal",
-        "client-area",
-        "member-login",
-        "account-verify",
-        "password-reset",
-        "security-check",
-        "identity-confirm",
-        "payment-update",
-        "billing-info",
-        "verification-required",
-    ]
+    suspicious_keywords = read_json("suspicious_keywords.json", "keywords")
 
     brands = ["google", "facebook", "paypal", "amazon", "apple", "microsoft", "netflix"]
 
@@ -226,180 +299,7 @@ def process_parquet(file_path, batch_size=5000):
         batch_size = len(df)
         total_records += batch_size
         print(f"Batch {batch_idx+1}: {batch_size} records (total: {total_records})")
-
-        # Process A records (IP addresses)
-        a_records = df[df["query_type"] == "A"]
-        for _, row in a_records.iterrows():
-            if pd.notna(row.get("ip4_address")):
-                domain = row["query_name"].rstrip(".")
-                ip = row["ip4_address"]
-                ttl = row.get("response_ttl", 0)
-                timestamp = row.get("timestamp", 0)
-
-                # Store domain info
-                if domain not in domains:
-                    domains[domain] = {
-                        "ips": set(),
-                        "nameservers": set(),
-                        "mail_servers": set(),
-                        "first_seen": timestamp,
-                        "record_types": set(),
-                        "ttl": [],
-                        "keywords": set(),
-                    }
-
-                domains[domain]["ips"].add(ip)
-                domains[domain]["ttl"].append(ttl)
-                domains[domain]["record_types"].add("A")
-
-                # Map IP to domain
-                if ip not in ip_to_domains:
-                    ip_to_domains[ip] = set()
-                ip_to_domains[ip].add(domain)
-
-                # Check domain name for suspicious keywords
-                ext = tldextract.extract(domain)
-                base_domain = ext.domain.lower()
-
-                for keyword in suspicious_keywords:
-                    if keyword in base_domain:
-                        domains[domain]["keywords"].add(keyword)
-                        if keyword not in keywords_found:
-                            keywords_found[keyword] = set()
-                        keywords_found[keyword].add(domain)
-
-                for brand in brands:
-                    if brand in base_domain and brand != base_domain:
-                        domains[domain]["keywords"].add(f"brand:{brand}")
-                        if "brand_impersonation" not in keywords_found:
-                            keywords_found["brand_impersonation"] = set()
-                        keywords_found["brand_impersonation"].add(domain)
-
-        # Process NS records
-        ns_records = df[df["query_type"] == "NS"]
-        for _, row in ns_records.iterrows():
-            if pd.notna(row.get("ns_address")):
-                domain = row["query_name"].rstrip(".")
-                ns = row["ns_address"].rstrip(".")
-
-                if domain in domains:
-                    domains[domain]["nameservers"].add(ns)
-                    domains[domain]["record_types"].add("NS")
-
-        # Process MX records
-        mx_records = df[df["query_type"] == "MX"]
-        for _, row in mx_records.iterrows():
-            if pd.notna(row.get("mx_address")):
-                domain = row["query_name"].rstrip(".")
-                mx = row["mx_address"].rstrip(".")
-
-                if domain in domains:
-                    domains[domain]["mail_servers"].add(mx)
-                    domains[domain]["record_types"].add("MX")
-
-        # Process SOA records
-        soa_records = df[df["query_type"] == "SOA"]
-        for _, row in soa_records.iterrows():
-            domain = row["query_name"].rstrip(".")
-
-            if domain in domains:
-                domains[domain]["record_types"].add("SOA")
-                if pd.notna(row.get("soa_serial")):
-                    domains[domain]["soa_serial"] = row.get("soa_serial")
-
-        # Free memory
-        del df
-
-    print(f"Finished processing {total_records} records")
-    print(f"Found {len(domains)} unique domains")
-
-    # Find suspicious domains
-    suspicious = []
-
-    # Find IP clusters
-    ip_clusters = {
-        ip: list(doms)
-        for ip, doms in ip_to_domains.items()
-        if len(doms) >= min_cluster_size
-    }
-
-    for domain, info in domains.items():
-        # Calculate suspicion score
-        score = 0
-        reasons = []
-
-        # Check if domain is in an IP cluster
-        for ip in info["ips"]:
-            if ip in ip_clusters:
-                score += 2
-                reasons.append(f"Shares IP {ip} with {len(ip_clusters[ip])} domains")
-                break
-
-        # Check for suspicious keywords
-        if info["keywords"]:
-            score += 3
-            reasons.append(f"Contains keywords: {', '.join(info['keywords'])}")
-
-        # Check for low TTL
-        if any(t < low_ttl_threshold for t in info["ttl"]):
-            score += 2
-            min_ttl = min(info["ttl"])
-            reasons.append(f"Low TTL: {min_ttl}")
-
-        # Check for missing essential records
-        if "MX" not in info["record_types"] and "SOA" not in info["record_types"]:
-            score += 1
-            reasons.append("Missing essential DNS records")
-
-        # If score is high enough, add to suspicious list
-        if score >= 5:
-            # Convert sets to lists for JSON serialization
-            domain_info = {
-                "domain": domain,
-                "score": score,
-                "reasons": reasons,
-                "ips": list(info["ips"]),
-                "nameservers": list(info["nameservers"]),
-                "mail_servers": list(info["mail_servers"]),
-                "record_types": list(info["record_types"]),
-                "first_seen": info["first_seen"],
-                "first_seen_date": datetime.fromtimestamp(
-                    info["first_seen"] / 1000
-                ).strftime("%Y-%m-%d %H:%M:%S"),
-                "keywords": list(info["keywords"]),
-            }
-
-            suspicious.append(domain_info)
-
-    # Sort by score
-    suspicious.sort(key=lambda x: x["score"], reverse=True)
-    print(f"Found {len(suspicious)} suspicious domains")
-
-    # Prepare output
-    results = {
-        "analysis_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "total_domains": len(domains),
-        "suspicious_domains": suspicious,
-        "ip_clusters": ip_clusters,
-        "keyword_stats": {k: len(v) for k, v in keywords_found.items()},
-    }
-
-    # Save to file
-    output_file = "phishing_analysis.json"
-    with open(output_file, "w") as f:
-        json.dump(results, f, indent=2)
-
-    print(f"Results saved to {output_file}")
-
-    # Print top results
-    if suspicious:
-        print("\nTop suspicious domains:")
-        for domain in suspicious[:5]:
-            print(f"- {domain['domain']} (Score: {domain['score']})")
-            print(f"  Reasons: {', '.join(domain['reasons'])}")
-            print(f"  IPs: {', '.join(domain['ips'])}")
-
-    return suspicious
+        print(df.head())
 
 
 if __name__ == "__main__":

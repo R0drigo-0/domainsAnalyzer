@@ -1,4 +1,7 @@
 beatifulsoup4
+python-whois
 tldextract
+dnspython
+ipwhois
 pyarrow
 pandas

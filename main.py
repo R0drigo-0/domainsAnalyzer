@@ -75,7 +75,9 @@ class NewDomains:
             self.logger.error(f"Error converting parquet to CSV: {e}")
             return None
 
-    def _download_parquet_file(self, url: str, file_path: str, convert_to_csv:bool=True):
+    def _download_parquet_file(
+        self, url: str, file_path: str, convert_to_csv: bool = True
+    ):
         """Download a parquet file and optionally convert it to CSV"""
         if os.path.exists(file_path):
             self.logger.info(f"File {file_path} already exists, skipping download.")
@@ -318,10 +320,22 @@ class NewDomains:
         pass
 
     def fetch_open_intel(self):
-        pass    
+        pass
 
-    def run(self, date=None, sources=None, max_days=None, convert_to_csv=True):
+    def run(
+        self,
+        accept_terms: bool,
+        date=None,
+        sources=None,
+        max_days=None,
+        convert_to_csv=True,
+    ):
         self.logger.info("Starting domain fetcher")
+        if not accept_terms:
+            self.logger.error(
+                "You must accept the terms of service to proceed. https://www.openintel.nl/download/terms/"
+            )
+            return 
         paths = self._fetch_open_intel_zoneFile(
             date=date,
             all_active=True,
@@ -330,7 +344,6 @@ class NewDomains:
             max_days_per_month=max_days,
             convert_to_csv=convert_to_csv,
         )
-        
 
 
 def main():
@@ -339,6 +352,11 @@ def main():
         description="Fetch domain information from OpenINTEL"
     )
 
+    parser.add_argument(
+        "--accept-terms",
+        action="store_true",
+        help="Accept terms of service from https://www.openintel.nl/download/terms/",
+    )
     parser.add_argument("--date", type=str, help="Specific date to fetch (YYYY-MM-DD)")
     parser.add_argument(
         "--sources",
@@ -357,6 +375,7 @@ def main():
     try:
         worker = NewDomains()
         worker.run(
+            accept_terms=args.accept_terms,
             date=args.date,
             sources=args.sources,
             max_days=args.max_days,
