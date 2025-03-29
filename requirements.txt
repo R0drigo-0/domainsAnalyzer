@@ -2,6 +2,7 @@ beatifulsoup4
 python-whois
 tldextract
 dnspython
+openpyxl
 ipwhois
 pyarrow
 pandas
