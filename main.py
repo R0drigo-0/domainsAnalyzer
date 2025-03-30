@@ -4,13 +4,15 @@
 from requests.cookies import RequestsCookieJar
 from bs4 import BeautifulSoup
 
-from analyze import process_parquet
 
 from concurrent.futures import ThreadPoolExecutor
-import concurrent.futures
+from analyze import process_parquet
 
+import pyarrow.parquet as pq
 import pandas as pd
 
+
+import concurrent.futures
 import requests
 import datetime
 import argparse
@@ -33,10 +35,12 @@ class NewDomains:
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s - %(levelname)s: %(message)s",
-            handlers=[logging.StreamHandler()],
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler("worker.log", mode="a"),
+            ],
         )
 
-        # Get logger for this class
         self.logger = logging.getLogger(__name__)
 
         self.open_intel_zoneFile_url = (
@@ -44,13 +48,88 @@ class NewDomains:
         )
 
         self.stop_requested = False
+        self.chunk_size = 8192
 
-    def convert_parquet_to_csv(self, parquet_file: str, output_csv: str = None):
-        """Convert parquet file to CSV format"""
+    def convert_parquet_to_csv_chunked(self, parquet_file: str, chunksize: int = 8192):
         try:
-            if "pd" not in globals():
-                self.logger.error("pandas not installed. Cannot convert to CSV.")
-                return None
+            file_path = os.path.abspath(parquet_file)
+            file_dir = os.path.dirname(file_path)
+            base_name = os.path.basename(parquet_file).replace(".parquet", "")
+
+            output_dir = os.path.join(file_dir, base_name)
+            os.makedirs(output_dir, exist_ok=True)
+
+            manifest_path = os.path.join(output_dir, "manifest.json")
+            if os.path.exists(manifest_path):
+                self.logger.info(
+                    f"File {parquet_file} already processed, manifest found at {manifest_path}"
+                )
+                with open(manifest_path, "r") as f:
+                    return json.load(f)
+
+            file_size_mb = os.path.getsize(parquet_file) / (1024 * 1024)
+            self.logger.info(
+                f"Processing parquet file: {parquet_file} ({file_size_mb:.2f} MB)"
+            )
+            self.logger.info(f"Output directory: {output_dir}")
+            self.logger.info(f"Using chunk size of {chunksize} rows")
+
+            chunk_paths = []
+            total_rows = 0
+            file_count = 0
+
+            parquet_file_obj = pq.ParquetFile(parquet_file)
+
+            for i, batch in enumerate(
+                parquet_file_obj.iter_batches(batch_size=chunksize)
+            ):
+                file_count += 1
+                chunk_df = batch.to_pandas()
+                rows = len(chunk_df)
+                total_rows += rows
+
+                # Create chunk filename - simple integer naming
+                chunk_path = os.path.join(output_dir, f"{file_count}.csv")
+                chunk_df.to_csv(chunk_path, index=False)
+                chunk_paths.append(chunk_path)
+
+                self.logger.info(
+                    f"Wrote chunk {file_count} with {rows} rows to {chunk_path}"
+                )
+
+            manifest = {
+                "original_file": parquet_file,
+                "total_rows": total_rows,
+                "chunk_count": file_count,
+                "chunk_paths": chunk_paths,
+                "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "chunksize": chunksize,
+            }
+
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+
+            self.logger.info(
+                f"Successfully processed {parquet_file} into {file_count} chunks"
+            )
+            self.logger.info(f"Total rows: {total_rows}")
+            self.logger.info(f"Manifest file: {manifest_path}")
+
+            return manifest
+        except Exception as e:
+            self.logger.error(f"Error chunking parquet file: {e}")
+            return None
+
+    def convert_parquet_to_csv(
+        self,
+        parquet_file: str,
+        output_csv: str = None,
+        use_chunking: bool = False,
+        chunksize: int = 8192,
+    ):
+        try:
+            if use_chunking:
+                return self.convert_parquet_to_csv_chunked(parquet_file, chunksize)
 
             if not output_csv:
                 output_csv = parquet_file.replace(".parquet", ".csv")
@@ -61,12 +140,10 @@ class NewDomains:
                 )
                 return output_csv
 
-            self.logger.info(f"Converting {parquet_file} to CSV...")
+            file_size_mb = os.path.getsize(parquet_file) / (1024 * 1024)
+            self.logger.info(f"Converting {parquet_file} with size {file_size_mb}MB to CSV...")
 
-            # Read the parquet file
             df = pd.read_parquet(parquet_file)
-
-            # Write to CSV
             df.to_csv(output_csv, index=False)
 
             self.logger.info(f"Successfully converted to {output_csv}")
@@ -75,35 +152,202 @@ class NewDomains:
             self.logger.error(f"Error converting parquet to CSV: {e}")
             return None
 
-    def _download_parquet_file(
-        self, url: str, file_path: str, convert_to_csv: bool = True
+    def stream_to_parquet_chunks(
+        self,
+        url: str,
+        output_dir: str,
+        base_name: str,
+        chunksize: int = 8192,
     ):
-        """Download a parquet file and optionally convert it to CSV"""
-        if os.path.exists(file_path):
-            self.logger.info(f"File {file_path} already exists, skipping download.")
-            # If CSV conversion is requested, check if CSV exists
-            if convert_to_csv:
-                csv_path = file_path.replace(".parquet", ".csv")
-                if not os.path.exists(csv_path):
-                    self.convert_parquet_to_csv(file_path)
-            return
-
+        if self.stop_requested:
+            self.logger.info("Stop requested, aborting download")
+            return None
         try:
+            chunk_dir = os.path.join(output_dir, base_name)
+            os.makedirs(chunk_dir, exist_ok=True)
+            
+            manifest_path = os.path.join(chunk_dir, "manifest.json")
+            if os.path.exists(manifest_path):
+                self.logger.info(f"Chunks already exist for {base_name}, manifest found at {manifest_path}")
+                with open(manifest_path, "r") as f:
+                    return json.load(f)
+            
+            temp_file = os.path.join(output_dir, f"{base_name}_temp.parquet")
+            
+            self.logger.info(f"Streaming {url} to chunks in {chunk_dir}")
             res = requests.get(url, stream=True, verify=False)
             res.raise_for_status()
+            
+            total_size = int(res.headers.get("content-length", 0))
+            downloaded_size = 0
+            start_time = time.time()
+            chunk_count = 0
+            
+            with open(temp_file, "wb") as f:
+                for chunk in res.iter_content(chunk_size=self.chunk_size):
+                    if self.stop_requested:
+                        self.logger.info("Stop requested, aborting download")
+                        if os.path.exists(temp_file):
+                            os.remove(temp_file)
+                        return None
+                    
+                    if chunk:
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        chunk_count += 1
+                        
+                        if chunk_count % 50 == 0 and total_size > 0:
+                            percent = (downloaded_size / total_size) * 100
+                            elapsed = time.time() - start_time
+                            speed = (
+                                downloaded_size / (1024 * 1024 * elapsed)
+                                if elapsed > 0
+                                else 0
+                            )
+                            self.logger.info(
+                                f"Download progress: {percent:.1f}% ({downloaded_size/(1024*1024):.1f} MB of {total_size/(1024*1024):.1f} MB), {speed:.1f} MB/s"
+                            )
+            
+            self.logger.info(f"Processing downloaded file into parquet chunks...")
+            
+            chunk_paths = []
+            total_rows = 0
+            file_count = 0
+            
+            try:
+                parquet_file_obj = pq.ParquetFile(temp_file)
+                
+                for i, batch in enumerate(parquet_file_obj.iter_batches(batch_size=chunksize)):
+                    if self.stop_requested:
+                        break
+                        
+                    file_count += 1
+                    chunk_df = batch.to_pandas()
+                    rows = len(chunk_df)
+                    total_rows += rows
+                    
+                    chunk_path = os.path.join(chunk_dir, f"{file_count}.parquet")
+                    
+                    chunk_df.to_parquet(chunk_path, index=False)
+                    chunk_paths.append(chunk_path)
+                    
+                    self.logger.info(f"Wrote chunk {file_count} with {rows} rows to {chunk_path}")
+                
+                manifest = {
+                    "source_url": url,
+                    "total_rows": total_rows,
+                    "chunk_count": file_count,
+                    "chunk_paths": chunk_paths,
+                    "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "chunksize": chunksize,
+                }
+                
+                with open(manifest_path, "w") as f:
+                    json.dump(manifest, f, indent=2)
+                    
+                self.logger.info(f"Successfully processed data into {file_count} parquet chunks")
+                self.logger.info(f"Total rows: {total_rows}")
+                self.logger.info(f"Manifest file: {manifest_path}")
+                
+                return manifest
+                
+            finally:
+                if os.path.exists(temp_file):
+                    self.logger.info(f"Removing temporary file {temp_file}")
+                    os.remove(temp_file)
+                    
+        except Exception as e:
+            self.logger.error(f"Error in stream_to_parquet_chunks: {e}")
+            if 'temp_file' in locals() and os.path.exists(temp_file):
+                os.remove(temp_file)
+            return None
 
-            with open(file_path, "wb") as f:
-                for chunk in res.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            self.logger.info(f"Downloaded {file_path}")
-
-            if convert_to_csv:
-                self.convert_parquet_to_csv(file_path)
-
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Failed to download {url}: {e}")
-
+    def _download_parquet_file(
+        self,
+        url: str,
+        file_path: str,
+        convert_to_csv: bool = False,
+        use_chunking: bool = False,
+        chunksize: int = 8192,
+    ):
+        output_dir = os.path.dirname(file_path)
+        base_name = os.path.basename(file_path).replace(".parquet", "")
+        
+        chunk_dir = os.path.join(output_dir, base_name)
+        manifest_path = os.path.join(chunk_dir, "manifest.json")
+        
+        if os.path.exists(manifest_path):
+            self.logger.info(f"Chunks already exist for {base_name}")
+            if convert_to_csv and use_chunking:
+                self.logger.info(f"CSV conversion requested, checking if needed")
+                pass
+            return
+        
+        if os.path.exists(file_path):
+            self.logger.info(f"File {file_path} already exists, processing into chunks")
+            try:
+                os.makedirs(chunk_dir, exist_ok=True)
+                
+                file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                self.logger.info(f"Processing {file_path} ({file_size_mb:.2f} MB) into chunks")
+                
+                chunk_paths = []
+                total_rows = 0
+                file_count = 0
+                
+                parquet_file_obj = pq.ParquetFile(file_path)
+                
+                for i, batch in enumerate(parquet_file_obj.iter_batches(batch_size=chunksize)):
+                    if self.stop_requested:
+                        break
+                        
+                    file_count += 1
+                    chunk_df = batch.to_pandas()
+                    rows = len(chunk_df)
+                    total_rows += rows
+                    
+                    chunk_path = os.path.join(chunk_dir, f"{file_count}.parquet")
+                    
+                    chunk_df.to_parquet(chunk_path, index=False)
+                    chunk_paths.append(chunk_path)
+                    
+                    self.logger.info(f"Wrote chunk {file_count} with {rows} rows to {chunk_path}")
+                
+                manifest = {
+                    "original_file": file_path,
+                    "total_rows": total_rows,
+                    "chunk_count": file_count,
+                    "chunk_paths": chunk_paths,
+                    "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "chunksize": chunksize,
+                }
+                
+                with open(manifest_path, "w") as f:
+                    json.dump(manifest, f, indent=2)
+                    
+                self.logger.info(f"Successfully processed data into {file_count} parquet chunks")
+                return
+            except Exception as e:
+                self.logger.error(f"Error chunking existing file: {e}")
+        
+        self.logger.info(f"Streaming {url} directly to parquet chunks")
+        if use_chunking:
+            self.stream_to_parquet_chunks(
+                url=url,
+                output_dir=output_dir,
+                base_name=base_name,
+                chunksize=chunksize
+            )
+        else:
+            self.stream_to_parquet_chunks(url=url, output_dir=output_dir, base_name=base_name, chunksize=9223372036854775807)
+        
+        if convert_to_csv and use_chunking:
+            self.convert_parquet_to_csv_chunked(
+                parquet_file=file_path,
+                chunksize=chunksize
+            )
+            pass
+    
     def _fetch_open_intel_zoneFile(
         self,
         date: str = None,
@@ -111,7 +355,9 @@ class NewDomains:
         max_workers: int = 10,
         sources_to_process: str = None,
         max_days_per_month: int = None,
-        convert_to_csv: bool = True,
+        convert_to_csv: bool = False,
+        chunking: bool = True,
+        chunksize: int = 8192,
     ):
         jar = RequestsCookieJar()
         jar.set("openintel-data-agreement-accepted", "true")
@@ -194,7 +440,11 @@ class NewDomains:
 
                         os.makedirs("./zoneFile", exist_ok=True)
                         self._download_parquet_file(
-                            parquet_url, f"./zoneFile/{filename}", True
+                            url=parquet_url,
+                            file_path=f"./zoneFile/{filename}",
+                            convert_to_csv=convert_to_csv,
+                            use_chunking=chunking,
+                            chunksize=chunksize,
                         )
                         self.downloaded_files += 1
                         self.logger.info(
@@ -324,18 +574,21 @@ class NewDomains:
 
     def run(
         self,
-        accept_terms: bool,
-        date=None,
-        sources=None,
-        max_days=None,
-        convert_to_csv=True,
+        accept_terms: bool = False,
+        date: str = None,
+        sources: str = None,
+        max_days: int = None,
+        convert_to_csv: bool = False,
+        chunking: bool = True,
+        chunksize: int = 8192,
     ):
         self.logger.info("Starting domain fetcher")
+        self.logger.info(f"Is Chunking enabled: {chunking}")
         if not accept_terms:
             self.logger.error(
                 "You must accept the terms of service to proceed. https://www.openintel.nl/download/terms/"
             )
-            return 
+            return
         paths = self._fetch_open_intel_zoneFile(
             date=date,
             all_active=True,
@@ -343,6 +596,8 @@ class NewDomains:
             sources_to_process=sources,
             max_days_per_month=max_days,
             convert_to_csv=convert_to_csv,
+            chunking=chunking,
+            chunksize=chunksize,
         )
 
 
@@ -368,6 +623,15 @@ def main():
         "--max-days", type=int, help="Maximum days per month to process"
     )
     parser.add_argument("--csv", action="store_true", help="Convert .parquet to .csv")
+    parser.add_argument(
+        "--no-chunking", action="store_true", help="Disable chunking for large files"
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=8192,
+        help="Chunk size for CSV conversion (default: 8192)",
+    )
 
     args = parser.parse_args()
 
@@ -380,6 +644,8 @@ def main():
             sources=args.sources,
             max_days=args.max_days,
             convert_to_csv=args.csv,
+            chunking=not args.no_chunking,
+            chunksize=args.chunk_size,
         )
     except KeyboardInterrupt:
         print("\n\nKeyboard interrupt received. Shutting down gracefully...")
