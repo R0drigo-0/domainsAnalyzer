@@ -1,141 +1,104 @@
 from requests.cookies import RequestsCookieJar
-from datetime import datetime
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
-
+from typing import Dict
 import requests
 import logging
 import urllib3
-import asyncio
-import aiohttp
 import json
+import time
+import os
 
-urllib3.disable_warnings(
-    urllib3.exceptions.InsecureRequestWarning
-)  # To avoid SSL warnings
-
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class OpenIntelCrawler:
     def __init__(self, cookies):
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s - %(levelname)s: %(message)s",
-            handlers=[
-                logging.StreamHandler(),
-            ],
+            handlers=[logging.StreamHandler()],
         )
         self.logger = logging.getLogger("OpenIntelCrawler")
         self.cookies = cookies
-        self.base_openintel_url = "https://www.openintel.nl"
+        self.base_url = "https://www.openintel.nl"
         self.visited_urls = set()
-        self.unique_lock = asyncio.Lock()
 
-    def get_links_from_url(
-        self,
-        url,
-        source,
-        date=None,
-        max_days=None,
-        base_url="https://www.openintel.nl/download",
-    ):
-        self.logger.info(f"Fetching links from {url} with source {source}")
-        try:
-            response = requests.get(url, cookies=self.cookies, verify=False, timeout=30)
-            response.raise_for_status()
-
-            soup = BeautifulSoup(response.text, "html.parser")
-            table = soup.find("table", id="index_table")
-
-            if not table:
-                self.logger.error(f"No table found at {url}")
-                return []
-
-            links = []
-            for href in table.find_all("a", href=True):
-
-                href_text = href.get_text(strip=True)
-                if href_text.startswith(source):
-                    link_url = f"{base_url}{href['href']}"
-                    links.append((href_text, link_url))
-
-            # Apply filtering
-            if date and source == "day=":
-                target_day = f"day={date.split('-')[2]}"
-                links = [link for link in links if link[0] == target_day]
-
-            if max_days and source == "day=":
-                links = links[:max_days]
-
-            return links
-        except Exception as e:
-            self.logg7er.error(f"Error fetching links from {url}: {e}")
+    def extract_urls_from_table(self, html_content: str) -> list:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        table = soup.find('table', id='index_table')
+        if not table:
             return []
-
-    async def store_openIntel_directory_structure(
-        self,
-        base_url="https://www.openintel.nl/download/",
-        output_file="openintel_structure.json",
-    ):
-        async with self.unique_lock:
-            if base_url in self.visited_urls:
-                self.logger.info(f"Already processed {base_url}. Skipping...")
-                return {"url": base_url, "children": {}}
-            self.visited_urls.add(base_url)
-        self.logger.info(
-            f"Starting to crawl OpenINTEL directory structure from {base_url}"
-        )
-        start_time = datetime.now()
-        node = {"url": base_url, "children": {}}
+        
+        urls = []
+        for cell in table.find_all('td', class_='ellipsis'):
+            anchor = cell.find('a')
+            if anchor and anchor.has_attr('href'):
+                absolute_url = urljoin(self.base_url, anchor['href'])
+                urls.append(absolute_url)
+        return urls
+    
+    def get_urls_from_webpage(self, url: str) -> list:
+        if url in self.visited_urls:
+            return []
+            
+        self.visited_urls.add(url)
+        self.logger.info(f"Fetching: {url}")
+        
         try:
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(
-                cookies=self.cookies, timeout=timeout
-            ) as session:
-                async with session.get(base_url, ssl=False) as response:
-                    response.raise_for_status()
-                    html = await response.text()
-                    soup = BeautifulSoup(html, "html.parser")
-                    table = soup.find("table", id="index_table")
-                    if not table:
-                        self.logger.error(f"No table found at {base_url}")
-                        return node
-                    tasks = []
-                    for td in table.find_all("td", class_="ellipsis"):
-                        a = td.find("a", href=True)
-                        if a:
-                            href = a.get("href")
-                            text = a.get_text(strip=True)
-                            url = f"{self.base_openintel_url}{href}"
-                            self.logger.info(f"Found link: {text} -> {url}")
-                            if url.lower().endswith(".parquet"):
-                                node["children"][text] = {"url": url, "children": {}}
-                            else:
-                                task = asyncio.create_task(
-                                    self.store_openIntel_directory_structure(
-                                        base_url=url, output_file=output_file
-                                    )
-                                )
-                                tasks.append((text, task))
-                    if tasks:
-                        results = await asyncio.gather(
-                            *(t[1] for t in tasks), return_exceptions=True
-                        )
-                        for (text, _), result in zip(tasks, results):
-                            if not isinstance(result, Exception):
-                                node["children"][text] = result
-                    self.logger.info(f"Completed processing {base_url}")
+            response = requests.get(url, cookies=self.cookies, verify=False, timeout=10)
+            if response.status_code == 200:
+                return self.extract_urls_from_table(response.text)
+            else:
+                self.logger.error(f"Failed to retrieve: {url}, status: {response.status_code}")
+                return []
         except Exception as e:
-            self.logger.error(f"Error processing {base_url}: {e}")
-        duration = (datetime.now() - start_time).total_seconds()
-        self.logger.info(f"Completed in {duration:.2f} seconds")
-        return node
+            self.logger.error(f"Error fetching {url}: {str(e)}")
+            return []
+    
+    def crawl_recursively(self, start_url: str, max_depth: int = 9223372036854775807, delay: float = 0) -> Dict:
+        self.visited_urls.clear()
+        
+        def _crawl(url: str, depth: int) -> Dict:
+            if depth > max_depth:
+                return {}
+                
+            urls = self.get_urls_from_webpage(url)
+            time.sleep(delay)
+            
+            result = {}
+            for child_url in urls:
+                path = child_url
+                result[path] = _crawl(child_url, depth + 1)
+            return result
+        
+        return _crawl(start_url, 1)
+
+    def print_url_structure(self, structure: Dict, indent: int = 0) -> None:
+        for url, children in structure.items():
+            print('  ' * indent + f"{url}")
+            if children:
+                self.print_url_structure(children, indent + 1)
+
+    def store_url_structure(self, structure: Dict, filename: str = "url_structure.json") -> None:
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(structure, f, indent=2)
+            self.logger.info(f"URL structure saved to {os.path.abspath(filename)}")
+        except Exception as e:
+            self.logger.error(f"Error saving URL structure: {e}")
 
 
 if __name__ == "__main__":
     cookies = {"openintel-data-agreement-accepted": "true"}
+    base_url = "https://www.openintel.nl/download"
     crawler = OpenIntelCrawler(cookies)
-    asyncio.run(
-        crawler.store_openIntel_directory_structure(
-            base_url="https://www.openintel.nl/download/forward-dns/basis=zonefile/",
-            output_file="openintel_structure_zoneFile.json",
-        )
-    )
+    
+    url_structure = crawler.crawl_recursively(base_url, max_depth=2)
+    
+    print("\nURL Structure:")
+    crawler.print_url_structure(url_structure)
+    
+    print(f"\nTotal URLs visited: {len(crawler.visited_urls)}")
+    
+    # Save URL structure to JSON file
+    crawler.store_url_structure(url_structure)

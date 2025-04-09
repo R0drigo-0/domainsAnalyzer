@@ -1,0 +1,13 @@
+{
+  "https://www.openintel.nl/download/forward-dns": {
+    "https://www.openintel.nl/download/forward-dns/basis=toplist": {},
+    "https://www.openintel.nl/download/forward-dns/basis=zonefile": {}
+  },
+  "https://www.openintel.nl/download/domain-lists": {
+    "https://www.openintel.nl/download/domain-lists/cctlds": {}
+  },
+  "https://www.openintel.nl/download/rir-data": {
+    "https://www.openintel.nl/download/rir-data/rirs-rdns-formatted": {},
+    "https://www.openintel.nl/download/rir-data/whois-formatted": {}
+  }
+}

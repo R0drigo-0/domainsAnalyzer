@@ -1,4 +1,4 @@
-beatifulsoup4
+beautifulsoup4
 python-whois
 tldextract
 dnspython
